@@ -1,0 +1,329 @@
+block.c:    pstrcpy(bs->device_name, sizeof(bs->device_name), device_name);
+block.c:    if (bs->sg || !bdrv_is_inserted(bs)) {
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->sg)
+block.c:    bs->total_sectors = hint;
+block.c:    bs->file = NULL;
+block.c:    bs->total_sectors = 0;
+block.c:    bs->is_temporary = 0;
+block.c:    bs->encrypted = 0;
+block.c:    bs->valid_key = 0;
+block.c:    bs->open_flags = flags;
+block.c:	bs->enable_history_tracking=1;
+block.c:	bs->history_size = 0;
+block.c:	QSIMPLEQ_INIT(&bs->history_list);
+block.c:	bs->enable_throttle=0;
+block.c:	bs->throttle_delay=0;
+block.c:    bs->buffer_alignment = 512;
+block.c:    pstrcpy(bs->filename, sizeof(bs->filename), filename);
+block.c:    bs->drv = drv;
+block.c:    bs->opaque = qemu_mallocz(drv->instance_size);
+block.c:        bs->enable_write_cache = 1;
+block.c:    if (bs->is_temporary) {
+block.c:        ret = bdrv_file_open(&bs->file, filename, open_flags);
+block.c:    bs->keep_read_only = bs->read_only = !(open_flags & BDRV_O_RDWR);
+block.c:    ret = refresh_total_sectors(bs, bs->total_sectors);
+block.c:    if (bs->is_temporary) {
+block.c:    if (bs->file) {
+block.c:        bdrv_delete(bs->file);
+block.c:        bs->file = NULL;
+block.c:    qemu_free(bs->opaque);
+block.c:    bs->opaque = NULL;
+block.c:    bs->drv = NULL;
+block.c:    bs->growable = 1;
+block.c:        bs->is_temporary = 1;
+block.c:    if ((flags & BDRV_O_NO_BACKING) == 0 && bs->backing_file[0] != '\0') {
+block.c:        bs->backing_hd = bdrv_new("");
+block.c:                     filename, bs->backing_file);
+block.c:        if (bs->backing_format[0] != '\0')
+block.c:            back_drv = bdrv_find_format(bs->backing_format);
+block.c:        ret = bdrv_open(bs->backing_hd, backing_filename, back_flags, back_drv);
+block.c:        if (bs->is_temporary) {
+block.c:            bs->backing_hd->keep_read_only = !(flags & BDRV_O_RDWR);
+block.c:            bs->backing_hd->keep_read_only = bs->keep_read_only;
+block.c:        bs->media_changed = 1;
+block.c:        if (bs->change_cb)
+block.c:            bs->change_cb(bs->change_opaque);
+block.c:    if (bs->is_temporary) {
+block.c:    if (bs->drv) {
+block.c:        if (bs->backing_hd) {
+block.c:            bdrv_delete(bs->backing_hd);
+block.c:            bs->backing_hd = NULL;
+block.c:        bs->drv->bdrv_close(bs);
+block.c:        qemu_free(bs->opaque);
+block.c:        if (bs->is_temporary) {
+block.c:            unlink(bs->filename);
+block.c:        bs->opaque = NULL;
+block.c:        bs->drv = NULL;
+block.c:        if (bs->file != NULL) {
+block.c:            bdrv_close(bs->file);
+block.c:        bs->media_changed = 1;
+block.c:        if (bs->change_cb)
+block.c:            bs->change_cb(bs->change_opaque);
+block.c:    if (bs->device_name[0] != '\0') {
+block.c:    if (bs->file != NULL) {
+block.c:        bdrv_delete(bs->file);
+block.c:    if (bs->drv->bdrv_check == NULL) {
+block.c:    return bs->drv->bdrv_check(bs);
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (!bs->backing_hd) {
+block.c:    if (bs->backing_hd->keep_read_only) {
+block.c:    ro = bs->backing_hd->read_only;
+block.c:    strncpy(filename, bs->backing_hd->filename, sizeof(filename));
+block.c:    open_flags =  bs->backing_hd->open_flags;
+block.c:        bdrv_delete(bs->backing_hd);
+block.c:        bs->backing_hd = NULL;
+block.c:                bs->drv = NULL;
+block.c:            bs->backing_hd = bs_ro;
+block.c:        bs->backing_hd = bs_rw;
+block.c:                if (bdrv_write(bs->backing_hd, i, sector, 1) != 0) {
+block.c:    if (bs->backing_hd)
+block.c:        bdrv_flush(bs->backing_hd);
+block.c:        bdrv_delete(bs->backing_hd);
+block.c:        bs->backing_hd = NULL;
+block.c:            bs->drv = NULL;
+block.c:        bs->backing_hd = bs_ro;
+block.c:        bs->backing_hd->keep_read_only = 0;
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->growable)
+block.c:    BlockDriver *drv = bs->drv;
+block.c:        val = bs->dirty_bitmap[idx];
+block.c:                bs->dirty_count++;
+block.c:                bs->dirty_count--;
+block.c:        bs->dirty_bitmap[idx] = val;
+block.c:	if(bs->history_size==HISTORYMAX){
+block.c:		HistoryItem* first_hitem = QSIMPLEQ_FIRST(&bs->history_list);
+block.c:		QSIMPLEQ_REMOVE_HEAD(&bs->history_list, entry);
+block.c:		QSIMPLEQ_INSERT_TAIL(&bs->history_list, hitem, entry);
+block.c:		QSIMPLEQ_INSERT_TAIL(&bs->history_list, hitem, entry);
+block.c:		bs->history_size++;
+block.c:	BlockDriver *drv = bs->drv;
+block.c:    if (!bs->drv)
+block.c:    if (bs->read_only)
+block.c:    if (bs->dirty_bitmap) {
+block.c:    if (bs->wr_highest_sector < sector_num + nb_sectors - 1) {
+block.c:        bs->wr_highest_sector = sector_num + nb_sectors - 1;
+block.c:	if(bs->enable_throttle){
+block.c:		usleep(bs->throttle_delay);
+block.c:	if(bs->enable_history_tracking)
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->read_only)
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (!bs->growable || !drv->bdrv_getlength) {
+block.c:        return bs->total_sectors * BDRV_SECTOR_SIZE;
+block.c:    bs->cyls = cyls;
+block.c:    bs->heads = heads;
+block.c:    bs->secs = secs;
+block.c:    bs->type = type;
+block.c:    bs->removable = ((type == BDRV_TYPE_CDROM ||
+block.c:    bs->translation = translation;
+block.c:    *pcyls = bs->cyls;
+block.c:    *pheads = bs->heads;
+block.c:    *psecs = bs->secs;
+block.c:    return bs->type;
+block.c:    return bs->translation;
+block.c:    bs->on_read_error = on_read_error;
+block.c:    bs->on_write_error = on_write_error;
+block.c:    return is_read ? bs->on_read_error : bs->on_write_error;
+block.c:    return bs->removable;
+block.c:    return bs->read_only;
+block.c:    return bs->sg;
+block.c:    return bs->enable_write_cache;
+block.c:    bs->change_cb = change_cb;
+block.c:    bs->change_opaque = opaque;
+block.c:    if (bs->backing_hd && bs->backing_hd->encrypted)
+block.c:    return bs->encrypted;
+block.c:    BlockDriverState *backing_hd = bs->backing_hd;
+block.c:    return (bs->encrypted && !bs->valid_key);
+block.c:    if (bs->backing_hd && bs->backing_hd->encrypted) {
+block.c:        ret = bdrv_set_key(bs->backing_hd, key);
+block.c:        if (!bs->encrypted)
+block.c:    if (!bs->encrypted) {
+block.c:    } else if (!bs->drv || !bs->drv->bdrv_set_key) {
+block.c:    ret = bs->drv->bdrv_set_key(bs, key);
+block.c:        bs->valid_key = 0;
+block.c:    } else if (!bs->valid_key) {
+block.c:        bs->valid_key = 1;
+block.c:        bs->media_changed = 1;
+block.c:        if (bs->change_cb)
+block.c:            bs->change_cb(bs->change_opaque);
+block.c:    if (!bs->drv) {
+block.c:        pstrcpy(buf, buf_size, bs->drv->format_name);
+block.c:        if (!strcmp(name, bs->device_name)) {
+block.c:    return bs->device_name;
+block.c:    if (bs->open_flags & BDRV_O_NO_FLUSH) {
+block.c:    if (bs->drv && bs->drv->bdrv_flush)
+block.c:        bs->drv->bdrv_flush(bs);
+block.c:        if (bs->drv && !bdrv_is_read_only(bs) &&
+block.c:    assert(bs->drv);
+block.c:    if (bs->drv->no_zero_init) {
+block.c:    } else if (bs->file) {
+block.c:        return bdrv_has_zero_init(bs->file);
+block.c:    if (!bs->drv->bdrv_is_allocated) {
+block.c:        if (sector_num >= bs->total_sectors) {
+block.c:        n = bs->total_sectors - sector_num;
+block.c:    return bs->drv->bdrv_is_allocated(bs, sector_num, nb_sectors, pnum);
+block.c:        switch(bs->type) {
+block.c:                                    bs->device_name, type, bs->removable,
+block.c:                                    bs->locked);
+block.c:        if (bs->drv) {
+block.c:                                     bs->filename, bs->read_only,
+block.c:                                     bs->drv->format_name,
+block.c:            if (bs->backing_file[0] != '\0') {
+block.c:                          qstring_from_str(bs->backing_file));
+block.c:                             bs->rd_bytes, bs->wr_bytes,
+block.c:                             bs->rd_ops, bs->wr_ops,
+block.c:                             bs->wr_highest_sector *
+block.c:    if (*bs->device_name) {
+block.c:        qdict_put(dict, "device", qstring_from_str(bs->device_name));
+block.c:    if (bs->file) {
+block.c:        QObject *parent = bdrv_info_stats_bs(bs->file);
+block.c:        monitor_printf(mon, "history size %d\n", bs->history_size);
+block.c:		QSIMPLEQ_FOREACH(hitem, &bs->history_list, entry) {
+block.c:    if (bs->backing_hd && bs->backing_hd->encrypted)
+block.c:        return bs->backing_file;
+block.c:    else if (bs->encrypted)
+block.c:        return bs->filename;
+block.c:    if (!bs->backing_file) {
+block.c:        pstrcpy(filename, filename_size, bs->backing_file);
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->dirty_bitmap) {
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->file)
+block.c:        return bdrv_save_vmstate(bs->file, buf, pos, size);
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->file)
+block.c:        return bdrv_load_vmstate(bs->file, buf, pos, size);
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    BlockDriver *drv = bs->drv;
+block.c:        if (bs->file != NULL) {
+block.c:            return bdrv_can_snapshot(bs->file);
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->file)
+block.c:        return bdrv_snapshot_create(bs->file, sn_info);
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->file) {
+block.c:        ret = bdrv_snapshot_goto(bs->file, snapshot_id);
+block.c:        open_ret = drv->bdrv_open(bs, bs->open_flags);
+block.c:            bdrv_delete(bs->file);
+block.c:            bs->drv = NULL;
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->file)
+block.c:        return bdrv_snapshot_delete(bs->file, snapshot_id);
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->file)
+block.c:        return bdrv_snapshot_list(bs->file, psn_info);
+block.c:    BlockDriver *drv = bs->drv;
+block.c:	bs->rd_bytes += (unsigned) nb_sectors * BDRV_SECTOR_SIZE;
+block.c:	bs->rd_ops ++;
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->read_only)
+block.c:    if (bs->dirty_bitmap) {
+block.c:	if(bs->enable_throttle){
+block.c:		usleep(bs->throttle_delay);
+block.c://	printf("%s,%s, histry size %d\n", bs->filename,bs->device_name,bs->history_size);
+block.c:		if(bs->enable_history_tracking)
+block.c:		bs->wr_bytes += (unsigned) nb_sectors * BDRV_SECTOR_SIZE;
+block.c:        bs->wr_ops ++;
+block.c:        if (bs->wr_highest_sector < sector_num + nb_sectors - 1) {
+block.c:            bs->wr_highest_sector = sector_num + nb_sectors - 1;
+block.c:        if (!merge && bs->drv->bdrv_merge_requests) {
+block.c:            merge = bs->drv->bdrv_merge_requests(bs, &reqs[outidx], &reqs[i]);
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->open_flags & BDRV_O_NO_FLUSH) {
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    BlockDriver *drv = bs->drv;
+block.c:        ret = bs->media_changed;
+block.c:    bs->media_changed = 0;
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    if (bs->locked) {
+block.c:    return bs->locked;
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    bs->locked = locked;
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    BlockDriver *drv = bs->drv;
+block.c:    return qemu_memalign((bs && bs->buffer_alignment) ? bs->buffer_alignment : 512, size);
+block.c:    bs->dirty_count = 0;
+block.c:        if (!bs->dirty_bitmap) {
+block.c:            bs->dirty_bitmap = qemu_mallocz(bitmap_size);
+block.c:        if (bs->dirty_bitmap) {
+block.c:            qemu_free(bs->dirty_bitmap);
+block.c:            bs->dirty_bitmap = NULL;
+block.c:    bs->enable_throttle = enable;
+block.c:		if(bs->throttle_delay==0)
+block.c:			bs->throttle_delay = THROTTLE_DELAY;
+block.c:			bs->throttle_delay *= 2;
+block.c:   bs->enable_history_tracking = enable;
+block.c:    if (bs->dirty_bitmap &&
+block.c:        return bs->dirty_bitmap[chunk / (sizeof(unsigned long) * 8)] &
+block.c:    return bs->dirty_count;
+block-migration.c:			dev_name_len = strlen(blk->bmds->bs->device_name);
+block-migration.c:			qemu_put_buffer(f, (uint8_t *)blk->bmds->bs->device_name, dev_name_len);
+block-migration.c:		dev_name_len = strlen(blk->bmds->bs->device_name);
+block-migration.c:		qemu_put_buffer(f, (uint8_t *)blk->bmds->bs->device_name, dev_name_len);
+block-migration.c:	if (bs->type == BDRV_TYPE_HD) {
+block-migration.c:					bs->device_name);
+block-migration.c:					bs->device_name);
+block-migration.c:	int boundary=bs->history_size * HISTORY_ALPHA;
+block-migration.c:		HistoryItem *hitem=QSIMPLEQ_FIRST(&bs->history_list);
+block-migration.c:		QSIMPLEQ_REMOVE_HEAD(&bs->history_list, entry);
+block-migration.c:	for(i=boundary;i<bs->history_size;i++)
+block-migration.c:		HistoryItem *hitem=QSIMPLEQ_FIRST(&bs->history_list);
+block-migration.c:		QSIMPLEQ_REMOVE_HEAD(&bs->history_list, entry);
+block-migration.c:		if(bmds->bs->history_size!=0){
+cris-dis.c: * indent-tabs-mode: t
+cris-dis.c:   indent-tabs-mode: t
+dma-helpers.c:    qemu_bh_delete(dbs->bh);
+dma-helpers.c:    dbs->bh = NULL;
+dma-helpers.c:    dbs->bh = qemu_bh_new(reschedule_dma, dbs);
+dma-helpers.c:    qemu_bh_schedule(dbs->bh);
+dma-helpers.c:    for (i = 0; i < dbs->iov.niov; ++i) {
+dma-helpers.c:        cpu_physical_memory_unmap(dbs->iov.iov[i].iov_base,
+dma-helpers.c:                                  dbs->iov.iov[i].iov_len, !dbs->is_write,
+dma-helpers.c:                                  dbs->iov.iov[i].iov_len);
+dma-helpers.c:    dbs->acb = NULL;
+dma-helpers.c:    dbs->sector_num += dbs->iov.size / 512;
+dma-helpers.c:    qemu_iovec_reset(&dbs->iov);
+dma-helpers.c:    if (dbs->sg_cur_index == dbs->sg->nsg || ret < 0) {
+dma-helpers.c:        dbs->common.cb(dbs->common.opaque, ret);
+dma-helpers.c:        qemu_iovec_destroy(&dbs->iov);
+dma-helpers.c:    while (dbs->sg_cur_index < dbs->sg->nsg) {
+dma-helpers.c:        cur_addr = dbs->sg->sg[dbs->sg_cur_index].base + dbs->sg_cur_byte;
+dma-helpers.c:        cur_len = dbs->sg->sg[dbs->sg_cur_index].len - dbs->sg_cur_byte;
+dma-helpers.c:        mem = cpu_physical_memory_map(cur_addr, &cur_len, !dbs->is_write);
+dma-helpers.c:        qemu_iovec_add(&dbs->iov, mem, cur_len);
+dma-helpers.c:        dbs->sg_cur_byte += cur_len;
+dma-helpers.c:        if (dbs->sg_cur_byte == dbs->sg->sg[dbs->sg_cur_index].len) {
+dma-helpers.c:            dbs->sg_cur_byte = 0;
+dma-helpers.c:            ++dbs->sg_cur_index;
+dma-helpers.c:    if (dbs->iov.size == 0) {
+dma-helpers.c:    if (dbs->is_write) {
+dma-helpers.c:        dbs->acb = bdrv_aio_writev(dbs->bs, dbs->sector_num, &dbs->iov,
+dma-helpers.c:                                   dbs->iov.size / 512, dma_bdrv_cb, dbs);
+dma-helpers.c:        dbs->acb = bdrv_aio_readv(dbs->bs, dbs->sector_num, &dbs->iov,
+dma-helpers.c:                                  dbs->iov.size / 512, dma_bdrv_cb, dbs);
+dma-helpers.c:    if (!dbs->acb) {
+dma-helpers.c:        qemu_iovec_destroy(&dbs->iov);
+dma-helpers.c:    if (dbs->acb) {
+dma-helpers.c:        bdrv_aio_cancel(dbs->acb);
+dma-helpers.c:    dbs->acb = NULL;
+dma-helpers.c:    dbs->bs = bs;
+dma-helpers.c:    dbs->sg = sg;
+dma-helpers.c:    dbs->sector_num = sector_num;
+dma-helpers.c:    dbs->sg_cur_index = 0;
+dma-helpers.c:    dbs->sg_cur_byte = 0;
+dma-helpers.c:    dbs->is_write = is_write;
+dma-helpers.c:    dbs->bh = NULL;
+dma-helpers.c:    qemu_iovec_init(&dbs->iov, sg->nsg);
+dma-helpers.c:    if (!dbs->acb) {
+dma-helpers.c:    return &dbs->common;
+exec.c:        nb_tbs--;
+qemu-img.c:    if (!unsafe && bs->backing_format[0] != '\0') {
+qemu-img.c:        old_backing_drv = bdrv_find_format(bs->backing_format);
+qemu-img.c:            error("Invalid format name: '%s'", bs->backing_format);
+qemu-io.c:	if (bs->drv && bs->drv->format_name)
+qemu-io.c:		printf("format name: %s\n", bs->drv->format_name);
+qemu-io.c:	if (bs->drv && bs->drv->protocol_name)
+qemu-io.c:		printf("format name: %s\n", bs->drv->protocol_name);
+qemu-nbd.c:    fd_size = bs->total_sectors * 512;

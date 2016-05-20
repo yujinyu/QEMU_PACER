@@ -1,0 +1,31 @@
+Executing /etc/qemu-ifup
+Bringing up tap0 for bridged mode...
+Adding tap0 to br0...
+main
+raw_open
+CONFIG_LINUX_AIO is defined
+FLAG 0 not fall back
+use_aio=0
+raw_open
+CONFIG_LINUX_AIO is defined
+FLAG 2 not fall back
+use_aio=0
+main thread 139666000598848
+thread id in ap_main_loop(): 139665939568912
+migration requried time 0 no requirement
+migration-tcp: Migration starting at 10847786686671
+migration-tcp: Current local time and date: Fri Sep 30 16:56:00 2011
+migration-tcp: connect completed
+dirty block count 988
+Migration speed: 32430541
+Current local time and date: Fri Sep 30 17:00:25 2011
+set to dirty
+vm stop at : Fri Sep 30 17:00:51 2011
+Total Dirty block: 1626
+Total migration time 290705515079
+migration-tcp: tcp_close
+Executing /etc/qemu-ifdown
+Bringing down tap0 from bridged mode...
+Delete tap0 from br0...
+ * Reconfiguring network interfaces...
+   ...done.

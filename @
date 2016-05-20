@@ -1,0 +1,2000 @@
+/*
+ * QEMU live block migration
+ *
+ * Copyright IBM, Corp. 2009
+ *
+ * Authors:
+ *  Liran Schour   <lirans@il.ibm.com>
+ *
+ * This work is licensed under the terms of the GNU GPL, version 2.  See
+ * the COPYING file in the top-level directory.
+ *
+ */
+
+#include "qemu-common.h"
+#include "block_int.h"
+#include "hw/hw.h"
+#include "qemu-queue.h"
+#include "qdict.h" //add by Pacer
+#include "qint.h" //add by Pacer
+#include "qjson.h" //add by Pacer
+#include "qemu-timer.h"
+#include "monitor.h"
+#include "block-migration.h"
+#include "migration.h"
+#include "time.h"
+#include <assert.h>
+#include <zlib.h>
+
+//separate BULK BLOCK SIZE and DIRTY_BLOCK_SIZE 
+#define BULK_BLOCK_SIZE (BDRV_SECTORS_PER_BULK_CHUNK << BDRV_SECTOR_BITS) 
+//#define BDRV_SECTORS_PER_BULK_CHUNK 2048
+//#define BDRV_SECTORS_PER_BULK_CHUNK_BITS 11
+#define DIRTY_BLOCK_SIZE (BDRV_SECTORS_PER_DIRTY_CHUNK << BDRV_SECTOR_BITS)
+
+#define BLK_MIG_FLAG_DEVICE_BLOCK       0x01
+#define BLK_MIG_FLAG_EOS                0x02
+#define BLK_MIG_FLAG_PROGRESS           0x04
+#define BLK_MIG_FLAG_FS_BLOCKSIZE		0x08   
+#define BLK_MIG_FLAG_COMPRESSED_DEVICE_BLOCK 0x10
+
+#define BLK_MIG_COMPRESSION_LEVEL 1
+
+#define MAX_IS_ALLOCATED_SEARCH 65536
+
+//#define DEBUG_BLK_MIGRATION
+
+#ifdef DEBUG_BLK_MIGRATION
+#define DPRINTF(fmt, ...) \
+    do { printf("blk_migration: " fmt, ## __VA_ARGS__); } while (0)
+#else
+#define DPRINTF(fmt, ...) \
+    do { } while (0)
+#endif
+
+
+typedef struct BlkMigDevState {
+    BlockDriverState *bs;
+    int bulk_completed;
+    int shared_base;
+	int scheduling; //add by Pacer
+	int dirty_scheduling; 
+
+	WriteHistoryItem* currentHistoryItem;
+	WriteFreqItem* currentFreqItem;
+	int access_done;
+	int chunksize;
+	int chunksize_bit;
+	int64_t current_chunksector;
+	int current_chunklen;
+    int64_t cur_sector;
+    int64_t cur_dirty;
+    int64_t completed_sectors;
+    int64_t total_sectors;
+    int64_t dirty;
+    QSIMPLEQ_ENTRY(BlkMigDevState) entry;
+} BlkMigDevState;
+
+typedef struct BlkMigBlock {
+    uint8_t *buf;
+    BlkMigDevState *bmds;
+    int64_t sector;
+    int64_t nr_sectors; //add by Pacer
+    struct iovec iov;
+    QEMUIOVector qiov;
+    BlockDriverAIOCB *aiocb;
+    int ret;
+    int64_t time;
+    bool dirty;  //flag to mark a dirty block
+    QSIMPLEQ_ENTRY(BlkMigBlock) entry;
+} BlkMigBlock;
+
+//add by Pacer
+typedef struct AccessChunk {
+	int64_t chunkstart;
+	int length;
+	int64_t freq;
+    QSIMPLEQ_ENTRY(AccessChunk) entry;
+} AccessChunk;
+
+typedef struct UnaccessChunks {
+	int64_t chunkstart;
+	int length;
+	QSIMPLEQ_ENTRY(UnaccessChunks) entry;
+} UnaccessChunks;
+//end
+typedef struct BlkMigState {
+    int blk_enable;
+    int shared_base;
+    QSIMPLEQ_HEAD(bmds_list, BlkMigDevState) bmds_list;
+    QSIMPLEQ_HEAD(blk_list, BlkMigBlock) blk_list;
+    int submitted;
+    int read_done;
+    int transferred;
+    int64_t total_sector_sum;
+    int prev_progress;
+    int bulk_completed;
+    long double total_time;
+    int sparse; 
+    int fs_bsize; 
+    int compression;
+    z_stream incoming_stream;
+    z_stream outgoing_stream;
+    int compress_init_send_called;
+    int compress_init_recv_called;
+    int bulk_block_reads; 
+    int dirty_block_reads; 
+    uint64_t saving_traffic;
+    //add by Pacer
+    int64_t lastdirtyblk;
+    int scheduling;
+    int dscheduling;
+    int throttling;
+    int64_t throttling_starttime;
+    int64_t chunksize;
+    int64_t dirtyblocknum;
+    int rr;
+    QSIMPLEQ_HEAD(access_list, AccessChunk) access_list;
+    QSIMPLEQ_HEAD(unaccess_list,UnaccessChunks) unaccess_list;	
+    int writehistory_index;
+    BlkMigDevState *migrated_bmds;	 	
+    //end
+} BlkMigState;
+
+
+static BlkMigState block_mig_state;
+
+/* Function: do_compression */
+/* Description: Compress the data in the input_buffer to output_buffer. */
+/* Return the length of compressed data. */
+static uint32_t do_compression(uint8_t *input_buffer, uint32_t input_data_len, uint8_t *output_buffer, uint32_t output_bound)
+{
+		int status;
+
+		block_mig_state.outgoing_stream.next_in = input_buffer;
+		block_mig_state.outgoing_stream.avail_in = input_data_len;
+		
+		block_mig_state.outgoing_stream.next_out = output_buffer;
+		block_mig_state.outgoing_stream.avail_out = output_bound;
+
+		uint32_t compress_length=0;
+		 
+		status = deflate(&(block_mig_state.outgoing_stream), Z_FULL_FLUSH);
+		switch (status) {
+			case Z_OK:
+				compress_length=output_bound - block_mig_state.outgoing_stream.avail_out;
+				break;
+			default:
+				DPRINTF("Error in deflate: deflate returned %d\n", status);
+				break;
+		}
+		
+    	if(status!=Z_OK){
+    			DPRINTF("Switch to non-compress. The left buffer is %d\n",block_mig_state.outgoing_stream.avail_out);
+    			block_mig_state.compression=0;
+		  	    return 0;
+    	}else {
+			return compress_length;
+	}
+}
+
+/* Function: blk_send_with_len */
+/* Description: send the data in the buffer+offset of the block with length of data_len. If compression, compress the data first */
+/* Change the protocol: add the data length for each time of sending */
+static void blk_send_with_len(QEMUFile *f, BlkMigBlock *blk, uint32_t offset, uint32_t data_len, bool compression)
+{
+	uint8_t dev_name_len;
+	
+	if(compression) {
+		uint8_t* compressed_data;
+		uint32_t compress_bufferbound= compressBound(data_len);
+		compressed_data=qemu_malloc(compress_bufferbound);
+		uint32_t compressed_data_len=do_compression(blk->buf+offset, data_len, compressed_data, compress_bufferbound);
+		//if compression failed in any case, send the data without compression
+		if(compressed_data_len==0)
+		{
+			blk_send_with_len(f, blk, offset, data_len, false);
+		}
+		else {
+			qemu_put_be64(f, ((blk->sector+offset/BDRV_SECTOR_SIZE) << BDRV_SECTOR_BITS)
+    		    			| BLK_MIG_FLAG_COMPRESSED_DEVICE_BLOCK);
+
+			dev_name_len = strlen(blk->bmds->bs->device_name);
+			qemu_put_byte(f, dev_name_len);
+			qemu_put_buffer(f, (uint8_t *)blk->bmds->bs->device_name, dev_name_len);
+			qemu_put_be32(f,compressed_data_len);
+			qemu_put_buffer(f, compressed_data, compressed_data_len);
+		}
+		qemu_free(compressed_data);
+	}
+	else{
+		qemu_put_be64(f, ((blk->sector+offset/BDRV_SECTOR_SIZE) << BDRV_SECTOR_BITS)
+    		    			| BLK_MIG_FLAG_DEVICE_BLOCK);
+		dev_name_len = strlen(blk->bmds->bs->device_name);
+		qemu_put_byte(f, dev_name_len);
+		qemu_put_buffer(f, (uint8_t *)blk->bmds->bs->device_name, dev_name_len);
+		qemu_put_be32(f,data_len);
+	    qemu_put_buffer(f, blk->buf+offset, data_len);
+	}
+}
+
+/* Function: blk_send_nonzero_sectors */
+/* Description: segmenting a bulk block (4MB) into file system blocks (4KB), remove the zero file system blocks, send the non-zero ones */
+static void blk_send_nonzero_sectors(QEMUFile *f, BlkMigBlock * blk, bool compression,uint32_t block_size)
+{
+	int64_t scan_index=0;
+	int64_t scan_start=0;
+    int64_t not_zero_fsblock=0;
+    bool last_not_zero=false;
+    uint64_t* tmpbuf=(uint64_t*)(blk->buf);
+
+	/* segment the bulk block into fs block size, check whether the fs block is zero */
+    for(scan_index=0; scan_index<block_size; scan_index=scan_index+block_mig_state.fs_bsize)
+    {
+ 	       int index=0;
+		   /*scan every 64 bit to speed up the zero block checking*/
+	 	   while(index < (block_mig_state.fs_bsize/sizeof(uint64_t)) ){
+          		if(tmpbuf[scan_index/sizeof(uint64_t) + index]!= 0)
+           			break;
+				else
+					index++;
+           }
+	      /*if not a zero block */
+           if(index<(block_mig_state.fs_bsize/sizeof(uint64_t))){
+			    /*if the previous block is not a zero block either, accumulate them*/
+				if(last_not_zero==true){
+					not_zero_fsblock++;		
+				}
+				else{
+					/*if the previous block is a zero block, this block is the first non-zero block*/
+					scan_start=scan_index;
+					last_not_zero=true;
+					not_zero_fsblock++;
+				}
+	       }
+	       else{   
+			   /* if this is a zero block, send the previous non-zero blocks*/
+				if(last_not_zero==true){
+					uint32_t data_len=not_zero_fsblock * block_mig_state.fs_bsize;
+					blk_send_with_len(f, blk, scan_start, data_len, compression);
+					last_not_zero=false;
+					not_zero_fsblock=0;
+				}
+				block_mig_state.saving_traffic+=block_mig_state.fs_bsize;
+		  }
+	}
+	
+	/* if the last several blocks are non-zero blocks, need to send them*/
+	if(last_not_zero==true){
+		 uint32_t data_len=not_zero_fsblock * block_mig_state.fs_bsize;
+		 blk_send_with_len(f, blk, scan_start, data_len,compression);
+	}
+
+} 
+
+/* Function: blk_send */
+/* Description: send the block according to its property, e.g. dirty block, bulk block, whether checking the sparse block, whether do compression */
+static void blk_send(QEMUFile *f, BlkMigBlock * blk)
+{
+    
+	/*if a dirty block, send the block */
+/*	if(blk->dirty==true) {	
+		data_len = DIRTY_BLOCK_SIZE;
+		if(block_mig_state.compression==1)
+            blk_send_with_len(f, blk, 0, data_len, true);
+		else
+			blk_send_with_len(f, blk, 0, data_len, false);
+	}else{
+
+		if(block_mig_state.scheduling==0)
+			data_len=BULK_BLOCK_SIZE;
+		else
+			data_len=(block_mig_state.chunksize << BDRV_SECTOR_BITS);
+
+		if(block_mig_state.sparse == 1){
+			// if it is not a dirty block and sparse flag is set, check sparse block to send non-zero fs blocks only 
+			if(block_mig_state.compression==1)
+				blk_send_nonzero_sectors(f, blk, true,data_len);
+			else
+				blk_send_nonzero_sectors(f, blk, false,data_len);
+		}else {
+			// if not a dirty block and sparse flag is not set, send the bulk block 
+			if(block_mig_state.compression==1)
+				blk_send_with_len(f, blk, 0, data_len, true);
+			else
+				blk_send_with_len(f, blk, 0, data_len, false);
+		}
+		
+	} 
+*/
+//	printf("blk: %"PRId64" len %"PRId64"\n",blk->sector,blk->nr_sectors);
+	if(blk->dirty==true) {	
+		block_mig_state.dirtyblocknum++;
+		if(block_mig_state.compression==1)
+            		blk_send_with_len(f, blk, 0, ((blk->nr_sectors)<< BDRV_SECTOR_BITS), true);
+		else
+			blk_send_with_len(f, blk, 0, ((blk->nr_sectors)<< BDRV_SECTOR_BITS), false);
+	}else{
+
+		if(block_mig_state.sparse == 1){
+			// if it is not a dirty block and sparse flag is set, check sparse block to send non-zero fs blocks only 
+			if(block_mig_state.compression==1)
+				blk_send_nonzero_sectors(f, blk, true,((blk->nr_sectors)<< BDRV_SECTOR_BITS));
+			else
+				blk_send_nonzero_sectors(f, blk, false,((blk->nr_sectors)<< BDRV_SECTOR_BITS));
+		}else {
+			// if not a dirty block and sparse flag is not set, send the bulk block 
+			if(block_mig_state.compression==1)
+				blk_send_with_len(f, blk, 0, ((blk->nr_sectors)<< BDRV_SECTOR_BITS), true);
+			else
+				blk_send_with_len(f, blk, 0, ((blk->nr_sectors)<< BDRV_SECTOR_BITS), false);
+		}
+		
+	} 
+
+}
+
+/* Function: mig_compress_init_send */
+/* Description: initialize the compression stream at the source site*/
+/* if error occurs in the init function, switch to non-compression mode*/
+static void mig_compress_init_send(int level)
+{
+	if (block_mig_state.compress_init_send_called == 1)
+		deflateEnd(&block_mig_state.outgoing_stream);
+	
+	block_mig_state.compress_init_send_called = 1;
+
+	/* allocate deflate state */
+	block_mig_state.outgoing_stream.zalloc = Z_NULL;
+	block_mig_state.outgoing_stream.zfree = Z_NULL;
+	block_mig_state.outgoing_stream.opaque = Z_NULL;
+	int ret = deflateInit(&(block_mig_state.outgoing_stream), level);
+	if (ret != Z_OK)
+	{
+		DPRINTF("Deflate Init error (), switch to not compress\n");
+		block_mig_state.compression=0;
+	}
+}
+
+/* Function: mig_compress_init_recv */
+/* Description: initialize the compression stream at the destination site*/
+static void mig_compress_init_recv(void)
+{
+	if (block_mig_state.compress_init_recv_called == 1)
+		inflateEnd(&(block_mig_state.incoming_stream));
+	block_mig_state.compress_init_recv_called = 1;
+	
+	block_mig_state.incoming_stream.zalloc = Z_NULL;
+    block_mig_state.incoming_stream.zfree = Z_NULL;
+    block_mig_state.incoming_stream.opaque = Z_NULL;
+    block_mig_state.incoming_stream.avail_in=0;
+	block_mig_state.incoming_stream.next_in=Z_NULL;
+
+	int ret=inflateInit(&(block_mig_state.incoming_stream));
+	if (ret != Z_OK)
+    {
+         DPRINTF("Inflate Init error ()\n");
+    }
+}
+
+/* Function: mig_compress_cleanup */
+/* Description: clean up the compression functions */
+static void mig_compress_cleanup(void)
+{
+	if (block_mig_state.compress_init_recv_called == 1 ) 
+	{
+		inflateEnd(&block_mig_state.incoming_stream);
+		block_mig_state.compress_init_recv_called = 0;
+	}
+	if (block_mig_state.compress_init_send_called == 1 )
+	{
+		deflateEnd(&block_mig_state.outgoing_stream);
+		block_mig_state.compress_init_send_called = 0;
+	}
+}
+
+int blk_mig_active(void)
+{
+     return !QSIMPLEQ_EMPTY(&block_mig_state.bmds_list);
+}
+
+uint64_t blk_mig_bytes_transferred(void)
+{
+     BlkMigDevState *bmds;
+     uint64_t sum = 0;
+
+     QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+	    sum += bmds->completed_sectors;
+     }
+     return sum << BDRV_SECTOR_BITS;
+}
+
+uint64_t blk_mig_bytes_remaining(void)
+{
+	return blk_mig_bytes_total() - blk_mig_bytes_transferred();
+}
+/* Function: blk_mig_bytes_saving  */
+/* Description: return the amount of data that are saved by sparse checking */
+uint64_t blk_mig_bytes_saving(void)
+{
+	return block_mig_state.saving_traffic;
+}
+
+uint64_t blk_mig_bytes_total(void)
+{
+	BlkMigDevState *bmds;
+	uint64_t sum = 0;
+
+	QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+		sum += bmds->total_sectors;
+	}
+	return sum << BDRV_SECTOR_BITS;
+}
+
+static inline void add_avg_read_time(int64_t time, bool dirty)
+{
+	if(!dirty)
+		block_mig_state.bulk_block_reads++;
+	else
+		block_mig_state.dirty_block_reads++;
+	block_mig_state.total_time += time;
+}
+
+static inline long double compute_read_bwidth(void)
+{
+	assert(block_mig_state.total_time != 0);
+
+	return  (block_mig_state.bulk_block_reads * BULK_BLOCK_SIZE+block_mig_state.dirty_block_reads * DIRTY_BLOCK_SIZE)/ block_mig_state.total_time;
+
+}
+
+static void blk_mig_read_cb(void *opaque, int ret)
+{
+	
+	BlkMigBlock *blk = opaque;
+
+	blk->ret = ret;
+
+	blk->time = qemu_get_clock_ns(rt_clock) - blk->time;
+	add_avg_read_time(blk->time,blk->dirty);
+
+
+	QSIMPLEQ_INSERT_TAIL(&block_mig_state.blk_list, blk, entry);
+
+	block_mig_state.submitted--;
+	block_mig_state.read_done++;
+	assert(block_mig_state.submitted >= 0);
+}
+
+/*
+static int64_t getNextChunkSector(int* pnr_sectors)
+{
+//	printf("Enter getNextChunk\n");
+	UnaccessChunks* uachk;
+	AccessChunk* achk;
+	int nr_sectors;
+	if(block_mig_state.chunksize>=2*BDRV_SECTORS_PER_BULK_CHUNK)
+	{
+		while ((uachk = QSIMPLEQ_FIRST(&block_mig_state.unaccess_list)) != NULL) {
+			int64_t chunkstart=(int64_t)(uachk->chunkstart);
+			nr_sectors=(int)uachk->length;
+			if(nr_sectors>=2*BDRV_SECTORS_PER_BULK_CHUNK)
+			{
+				chunkstart=chunkstart+block_mig_state.chunksize;
+				uachk->chunkstart=chunkstart;
+				uachk->length=nr_sectors-block_mig_state.chunksize;
+				*pnr_sectors=block_mig_state.chunksize;
+				return chunkstart;
+			}else{
+				*pnr_sectors=nr_sectors;
+				QSIMPLEQ_REMOVE_HEAD(&block_mig_state.unaccess_list, entry);
+				qemu_free(uachk);
+				return chunkstart;
+			}
+		}
+
+		while ((achk = QSIMPLEQ_FIRST(&block_mig_state.access_list)) != NULL) {
+			int64_t chunkstart=(int64_t)(achk->chunkstart);
+			nr_sectors=(int)(achk->length);
+			if(nr_sectors>=2*BDRV_SECTORS_PER_BULK_CHUNK)
+			{
+				chunkstart=chunkstart+block_mig_state.chunksize;
+				achk->chunkstart=chunkstart;
+				achk->length=nr_sectors-block_mig_state.chunksize;
+				*pnr_sectors=block_mig_state.chunksize;
+				return chunkstart;
+			}else{
+				*pnr_sectors=nr_sectors;
+				QSIMPLEQ_REMOVE_HEAD(&block_mig_state.access_list, entry);
+				qemu_free(achk);
+				return chunkstart;
+			}
+		}
+	}else
+	{
+		while ((uachk = QSIMPLEQ_FIRST(&block_mig_state.unaccess_list)) != NULL) {
+			int64_t chunkstart=(int64_t)(uachk->chunkstart);
+			*pnr_sectors=(int)uachk->length;
+			QSIMPLEQ_REMOVE_HEAD(&block_mig_state.unaccess_list, entry);
+			qemu_free(uachk);
+			return chunkstart;
+		}
+
+		while ((achk = QSIMPLEQ_FIRST(&block_mig_state.access_list)) != NULL) {
+			int64_t chunkstart=(int64_t)(achk->chunkstart);
+			nr_sectors=(int)(achk->length);
+			QSIMPLEQ_REMOVE_HEAD(&block_mig_state.access_list, entry);
+			qemu_free(achk);
+			if(block_mig_state.chunksize<BDRV_SECTORS_PER_BULK_CHUNK){
+				while((achk = QSIMPLEQ_FIRST(&block_mig_state.access_list)) != NULL) {
+					int64_t chunkstart_new=(int64_t)(achk->chunkstart);
+					if((chunkstart_new==(chunkstart+nr_sectors))&&(nr_sectors<BULK_BLOCK_SIZE)){
+						nr_sectors=nr_sectors+(int)(achk->length);
+						QSIMPLEQ_REMOVE_HEAD(&block_mig_state.access_list, entry);
+						qemu_free(achk);
+						continue;
+					}else{
+						break;
+					}
+				}	
+			} 
+			*pnr_sectors=nr_sectors;
+			return chunkstart;
+		}
+	}
+	return -1;
+}
+static int64_t getNextChunkSector(int* pnr_sectors)
+{
+	int index=block_mig_state.writehistory_index;
+	BlockDriverState *bs=block_mig_state.migrated_bmds->bs;
+	AccessChunk* achk;
+	for(;index<bs->writehistory_size;index++)
+	{
+		if(bs->writehistory0[index].freq==0)
+		{
+			block_mig_state.writehistory_index=index+1;
+			*pnr_sectors= BDRV_SECTORS_PER_BULK_CHUNK;
+			return (index<<13);
+		}else{
+			//insert into access list
+			AccessChunk* accesschk;
+			accesschk = qemu_malloc(sizeof(AccessChunk));
+			accesschk->chunkstart=(int64_t)(index<<13);
+			accesschk->length=BDRV_SECTORS_PER_BULK_CHUNK;
+			accesschk->freq=bs->writehistory0[index].freq;
+
+			AccessChunk* preachk=NULL;
+			int found=0;
+			QSIMPLEQ_FOREACH(achk, &block_mig_state.access_list, entry) {
+				if((achk->freq)>(accesschk->freq)){
+					found=1;
+					break;
+				}else
+					preachk=achk;
+			}
+
+			if(found==1){
+				if(preachk==NULL){
+					QSIMPLEQ_INSERT_HEAD(&block_mig_state.access_list, accesschk, entry);
+				}else{
+					QSIMPLEQ_INSERT_AFTER(&block_mig_state.access_list, preachk, accesschk, entry);
+				}
+			}
+			else{
+				QSIMPLEQ_INSERT_TAIL(&block_mig_state.access_list, accesschk, entry);
+			}
+		}
+	}
+	//unaccess is done, need to get access
+	if ((achk = QSIMPLEQ_FIRST(&block_mig_state.access_list)) != NULL) {
+		int64_t chunkstart=(int64_t)(achk->chunkstart);
+		*pnr_sectors=(int)(achk->length);
+		QSIMPLEQ_REMOVE_HEAD(&block_mig_state.access_list, entry);
+		qemu_free(achk);
+
+		time_t rawtime;
+		 struct tm * timeinfo;
+	    	time ( &rawtime );
+	    	timeinfo = localtime ( &rawtime );
+	  	char timestring[30];
+     		strcpy(timestring,asctime(timeinfo));
+     		timestring[24]='\0';
+    		printf("migrate %s %"PRId64"\n ", timestring, chunkstart/8192);
+		
+		return chunkstart;
+	}else{
+		return -1;
+	}
+}*/
+
+static int64_t getNextChunkSector(int* pnr_sectors,BlkMigDevState* bmds)
+{
+	BlockDriverState *bs=bmds->bs;
+	WriteHistoryItem* currentHistory;
+	if(bmds->current_chunklen!=0)
+	{
+		*pnr_sectors=BDRV_SECTORS_PER_BULK_CHUNK;
+		bmds->current_chunklen=bmds->current_chunklen-BDRV_SECTORS_PER_BULK_CHUNK;
+		int64_t ret_sector= bmds->current_chunksector;
+		bmds->current_chunksector=bmds->current_chunksector+BDRV_SECTORS_PER_BULK_CHUNK;
+		return ret_sector;
+	}
+	if(bmds->access_done==0) 
+	{
+		//unaccess list
+		if(bmds->currentFreqItem==NULL)
+		{
+			if(bs->history_active_id==1)
+				bmds->currentFreqItem=bs->writefreqTail0;
+			else
+				bmds->currentFreqItem=bs->writefreqTail1;
+			printf("bs->history_active_id %d\n",bs->history_active_id);
+
+			currentHistory=bmds->currentFreqItem->head;
+		}else{
+			currentHistory=bmds->currentHistoryItem;
+		}
+		*pnr_sectors=BDRV_SECTORS_PER_BULK_CHUNK;
+		bmds->current_chunklen=bmds->chunksize-BDRV_SECTORS_PER_BULK_CHUNK;
+		int64_t ret_sector=(currentHistory->id)<<(bmds->chunksize_bit);
+		bmds->current_chunksector=ret_sector+BDRV_SECTORS_PER_BULK_CHUNK;
+		if(currentHistory->nextWHItem!=NULL)
+			bmds->currentHistoryItem=currentHistory->nextWHItem;
+		else{
+			if(bmds->currentFreqItem->previousFreqItem==NULL)
+				bmds->access_done=1;
+			else{
+				bmds->currentFreqItem=bmds->currentFreqItem->previousFreqItem;
+				bmds->currentHistoryItem=bmds->currentFreqItem->head;
+			}
+		}
+		return ret_sector;
+	}else return -1;
+	
+}
+
+static int mig_save_device_bulk(Monitor *mon, QEMUFile *f,
+		BlkMigDevState *bmds)
+{   
+	//add by Pacer
+	int64_t cur_sector =-1;
+	BlkMigBlock *blk;
+	if((block_mig_state.scheduling==1)&&(bmds->scheduling==1))
+	{
+		int64_t total_sectors = bmds->total_sectors;
+		int* pnr_sectors=qemu_malloc(sizeof(int));
+	//	printf("total_sectors %"PRId64"\n",total_sectors);	
+		cur_sector = (int64_t)getNextChunkSector(pnr_sectors,bmds);
+		int nr_sectors=*pnr_sectors;
+		qemu_free(pnr_sectors);	
+		//printf("getNextChunkSector %"PRId64" nr_sector %d\n",cur_sector,nr_sectors);
+		if(cur_sector==-1)
+			return 1;
+		BlockDriverState *bs = bmds->bs;
+	
+		
+		
+	/*	if (cur_sector >= total_sectors) {
+			bmds->cur_sector = bmds->completed_sectors = total_sectors;
+			return 1;
+		} */
+
+		
+
+		if (total_sectors <= cur_sector + nr_sectors ) {  
+			nr_sectors = total_sectors - cur_sector;
+		}
+		bmds->completed_sectors = bmds->completed_sectors+nr_sectors;
+
+		
+
+		blk = qemu_malloc(sizeof(BlkMigBlock));
+		blk->buf = qemu_malloc(nr_sectors* BDRV_SECTOR_SIZE);
+		blk->bmds = bmds;
+		blk->sector = cur_sector;
+		blk->nr_sectors=nr_sectors;
+		blk->dirty = false; 
+		blk->iov.iov_base = blk->buf;
+		blk->iov.iov_len = nr_sectors * BDRV_SECTOR_SIZE;
+		qemu_iovec_init_external(&blk->qiov, &blk->iov, 1);
+
+		blk->time = qemu_get_clock_ns(rt_clock);
+		blk->aiocb = bdrv_aio_readv(bs, cur_sector, &blk->qiov,
+				nr_sectors, blk_mig_read_cb, blk);
+		if (!blk->aiocb) {
+			goto error;
+		}
+		block_mig_state.submitted++;
+
+		bdrv_reset_dirty(bs, cur_sector, nr_sectors); //NOTE: this can affect result, the migration and dirty communicates!
+//		bmds->cur_sector = cur_sector + nr_sectors;
+	//	printf("return %d\n",bmds->cur_sector>=total_sectors);
+		return (bmds->cur_sector >= total_sectors);
+
+	}else
+	{
+		int64_t total_sectors = bmds->total_sectors;
+		cur_sector = bmds->cur_sector;
+		BlockDriverState *bs = bmds->bs;
+		int nr_sectors;
+
+		if (bmds->shared_base) {
+			while (cur_sector < total_sectors &&
+					!bdrv_is_allocated(bs, cur_sector, MAX_IS_ALLOCATED_SEARCH,
+						&nr_sectors)) {
+				cur_sector += nr_sectors;
+			}
+		}
+
+		if (cur_sector >= total_sectors) {
+			bmds->cur_sector = bmds->completed_sectors = total_sectors;
+			return 1;
+		}
+
+		bmds->completed_sectors = cur_sector;
+
+		cur_sector &= ~((int64_t)BDRV_SECTORS_PER_BULK_CHUNK - 1);  
+
+		/* we are going to transfer a full block even if it is not allocated */
+		nr_sectors = BDRV_SECTORS_PER_BULK_CHUNK; 
+
+		if (total_sectors - cur_sector < BDRV_SECTORS_PER_BULK_CHUNK) {  
+			nr_sectors = total_sectors - cur_sector;
+		}
+
+		blk = qemu_malloc(sizeof(BlkMigBlock));
+		blk->buf = qemu_malloc(BULK_BLOCK_SIZE);
+		blk->bmds = bmds;
+		blk->nr_sectors=nr_sectors;
+		blk->sector = cur_sector;
+		blk->dirty = false; 
+		blk->iov.iov_base = blk->buf;
+		blk->iov.iov_len = nr_sectors * BDRV_SECTOR_SIZE;
+		qemu_iovec_init_external(&blk->qiov, &blk->iov, 1);
+
+		blk->time = qemu_get_clock_ns(rt_clock);
+		blk->aiocb = bdrv_aio_readv(bs, cur_sector, &blk->qiov,
+				nr_sectors, blk_mig_read_cb, blk);
+		if (!blk->aiocb) {
+			goto error;
+		}
+		block_mig_state.submitted++;
+
+		bdrv_reset_dirty(bs, cur_sector, nr_sectors);
+		bmds->cur_sector = cur_sector + nr_sectors;
+
+		return (bmds->cur_sector >= total_sectors);
+	}
+error:
+	monitor_printf(mon, "Error reading sector %" PRId64 "\n", cur_sector);
+	qemu_file_set_error(f);
+	qemu_free(blk->buf);
+	qemu_free(blk);
+	return 0;
+}
+
+static void set_dirty_tracking(int enable)
+{
+	BlkMigDevState *bmds;
+
+	QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+		bdrv_set_dirty_tracking(bmds->bs, enable);
+	}
+}
+
+static void init_blk_migration_it(void *opaque, BlockDriverState *bs)
+{
+	Monitor *mon = opaque;
+	BlkMigDevState *bmds;
+	int64_t sectors;
+
+	if (bs->type == BDRV_TYPE_HD) {
+		sectors = bdrv_getlength(bs) >> BDRV_SECTOR_BITS;
+		if (sectors == 0) {
+			return;
+		}
+
+		bmds = qemu_mallocz(sizeof(BlkMigDevState));
+		bmds->bs = bs;
+		bmds->bulk_completed = 0;
+		bmds->total_sectors = sectors;
+		bmds->completed_sectors = 0;
+		bmds->currentFreqItem=NULL;
+		bmds->currentHistoryItem=NULL;
+
+		bmds->shared_base = block_mig_state.shared_base;
+
+		block_mig_state.total_sector_sum += sectors;
+
+		if (bmds->shared_base) {
+			monitor_printf(mon, "Start migration for %s with shared base "
+					"image\n",
+					bs->device_name);
+		} else {
+			monitor_printf(mon, "Start full migration for %s\n",
+					bs->device_name);
+		}
+
+		QSIMPLEQ_INSERT_TAIL(&block_mig_state.bmds_list, bmds, entry);
+
+
+	}
+}
+
+static void init_blk_migration(Monitor *mon, QEMUFile *f)
+{
+	block_mig_state.submitted = 0;
+	block_mig_state.read_done = 0;
+	block_mig_state.transferred = 0;
+	block_mig_state.total_sector_sum = 0;
+	block_mig_state.prev_progress = -1;
+	block_mig_state.bulk_completed = 0;
+	block_mig_state.total_time = 0;
+	block_mig_state.bulk_block_reads = 0;
+	block_mig_state.dirty_block_reads = 0;
+	block_mig_state.saving_traffic = 0;
+        block_mig_state.rr = 0;	
+	//add by Pacer
+	block_mig_state.throttling_starttime=0;
+	block_mig_state.lastdirtyblk=-1;
+	block_mig_state.writehistory_index=0;
+	
+	//end
+	bdrv_iterate(init_blk_migration_it, mon);
+}
+
+static int blk_mig_save_bulked_block(Monitor *mon, QEMUFile *f)
+{
+	int64_t completed_sector_sum = 0;
+	BlkMigDevState *bmds;
+	int progress;
+	int ret = 0;
+
+	QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+		if (bmds->bulk_completed == 0) {
+			if (mig_save_device_bulk(mon, f, bmds) == 1) {
+				/* completed bulk section for this device */
+				bmds->bulk_completed = 1;
+			}
+			completed_sector_sum += bmds->completed_sectors;
+			ret = 1;
+			break;
+		} else {
+			completed_sector_sum += bmds->completed_sectors;
+		}
+	}
+
+	progress = completed_sector_sum * 100 / block_mig_state.total_sector_sum;
+	if (progress != block_mig_state.prev_progress) {
+		block_mig_state.prev_progress = progress;
+		qemu_put_be64(f, (progress << BDRV_SECTOR_BITS)
+				| BLK_MIG_FLAG_PROGRESS);
+		monitor_printf(mon, "Completed %d %%\r", progress);
+		monitor_flush(mon);
+	}
+
+	return ret;
+}
+
+static void blk_mig_reset_dirty_cursor(void)
+{
+	BlkMigDevState *bmds;
+
+	QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+		bmds->cur_dirty = 0;
+	}
+}
+static int64_t getNextDirtySector(BlkMigDevState* bmds)
+{
+	BlockDriverState *bs=bmds->bs;
+	WriteHistoryItem* currentHistory;
+
+	if(bs->dirty_writefreqTail->previousFreqItem==NULL)
+		return -1;
+	else{
+		currentHistory=bs->dirty_writefreqTail->previousFreqItem->head;
+		return (currentHistory->id)<<(bs->dirty_chunksize_bit);
+	}
+}
+static int mig_save_device_dirty(Monitor *mon, QEMUFile *f,
+		BlkMigDevState *bmds, int is_async)
+{
+	BlkMigBlock *blk;
+	int64_t total_sectors = bmds->total_sectors;
+	int64_t sector;
+	int nr_sectors;
+	if((block_mig_state.scheduling==1)&&(bmds->dirty_scheduling==1))
+	{
+		
+		sector = (int64_t)getNextDirtySector(bmds);
+		//printf("getNextDirtysector %"PRId64"\n",sector);
+		if(sector==-1)
+			return 1;
+		if (total_sectors - sector < BDRV_SECTORS_PER_DIRTY_CHUNK) {
+			nr_sectors = total_sectors - sector;
+		} else {
+			nr_sectors = BDRV_SECTORS_PER_DIRTY_CHUNK;
+		}
+		blk = qemu_malloc(sizeof(BlkMigBlock));
+		blk->buf = qemu_malloc(DIRTY_BLOCK_SIZE); 
+		blk->dirty = true; 
+		blk->bmds = bmds;
+		blk->sector = sector;
+		blk->nr_sectors=nr_sectors;
+		if (is_async) {
+			blk->iov.iov_base = blk->buf;
+			blk->iov.iov_len = nr_sectors * BDRV_SECTOR_SIZE;
+			qemu_iovec_init_external(&blk->qiov, &blk->iov, 1);
+
+			blk->time = qemu_get_clock_ns(rt_clock);
+			blk->aiocb = bdrv_aio_readv(bmds->bs, sector, &blk->qiov,
+				nr_sectors, blk_mig_read_cb, blk);
+			if (!blk->aiocb) {
+				goto error;
+			}
+			block_mig_state.submitted++;
+		} else {
+			if (bdrv_read(bmds->bs, sector, blk->buf,
+				nr_sectors) < 0) {
+				goto error;
+			}
+			blk_send(f, blk);
+
+			qemu_free(blk->buf);
+			qemu_free(blk);
+		}
+		bdrv_reset_dirty(bmds->bs, sector, nr_sectors);
+		return 0;
+	}else{
+		//printf("no dirty scheduling\n");
+		for (sector = bmds->cur_dirty; sector < bmds->total_sectors;) {
+			if (bdrv_get_dirty(bmds->bs, sector)) {
+
+				if (total_sectors - sector < BDRV_SECTORS_PER_DIRTY_CHUNK) {
+					nr_sectors = total_sectors - sector;
+				} else {
+					nr_sectors = BDRV_SECTORS_PER_DIRTY_CHUNK;
+				}
+				blk = qemu_malloc(sizeof(BlkMigBlock));
+				blk->buf = qemu_malloc(DIRTY_BLOCK_SIZE); 
+				blk->dirty = true; 
+				blk->bmds = bmds;
+				blk->sector = sector;
+				blk->nr_sectors=nr_sectors;
+
+				if (is_async) {
+					blk->iov.iov_base = blk->buf;
+					blk->iov.iov_len = nr_sectors * BDRV_SECTOR_SIZE;
+					qemu_iovec_init_external(&blk->qiov, &blk->iov, 1);
+
+					blk->time = qemu_get_clock_ns(rt_clock);
+
+					blk->aiocb = bdrv_aio_readv(bmds->bs, sector, &blk->qiov,
+						nr_sectors, blk_mig_read_cb, blk);
+					if (!blk->aiocb) {
+						goto error;
+					}
+					block_mig_state.submitted++;
+				} else {
+					if (bdrv_read(bmds->bs, sector, blk->buf,
+								nr_sectors) < 0) {
+						goto error;
+					}
+					blk_send(f, blk);
+
+					qemu_free(blk->buf);
+					qemu_free(blk);
+				}
+
+				bdrv_reset_dirty(bmds->bs, sector, nr_sectors);
+				break;
+			}
+			sector += BDRV_SECTORS_PER_DIRTY_CHUNK;
+			bmds->cur_dirty = sector;
+		}
+	
+		return (bmds->cur_dirty >= bmds->total_sectors);
+	}
+
+error:
+	monitor_printf(mon, "Error reading sector %" PRId64 "\n", sector);
+	qemu_file_set_error(f);
+	qemu_free(blk->buf);
+	qemu_free(blk);
+	return 0;
+}
+
+static int blk_mig_save_dirty_block(Monitor *mon, QEMUFile *f, int is_async)
+{
+	BlkMigDevState *bmds;
+	int ret = 0;
+
+	QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+		if (mig_save_device_dirty(mon, f, bmds, is_async) == 0) {
+			ret = 1;
+			break;
+		}
+	}
+
+	return ret;
+}
+
+/* Function: is_zero_block */
+/* Description: check whether a bulk block is a zero block. Zero block: return true, otherwise, return false */
+static bool is_zero_block(BlkMigBlock * blk)
+{
+	uint32_t block_size = BULK_BLOCK_SIZE; 
+	uint64_t tempsize=block_size/sizeof(uint64_t);
+        uint64_t* tempbuf=(uint64_t*) blk->buf;
+        while(tempsize--){
+                if(*tempbuf++!= 0)
+                        return false;
+        }
+        return true;
+}
+
+
+static void flush_blks(QEMUFile* f)
+{
+	BlkMigBlock *blk;
+
+	DPRINTF("%s Enter submitted %d read_done %d transferred %d\n",
+            __FUNCTION__, block_mig_state.submitted, block_mig_state.read_done,
+            block_mig_state.transferred);
+
+	while ((blk = QSIMPLEQ_FIRST(&block_mig_state.blk_list)) != NULL) {
+		if (qemu_file_rate_limit(f)) {
+			break;
+		}
+		if (blk->ret < 0) {
+			qemu_file_set_error(f);
+			break;
+		}
+
+		if((block_mig_state.sparse !=1)||(blk->dirty))
+			blk_send(f, blk);
+		else{
+			int zb=is_zero_block(blk);
+			if(!zb)
+				blk_send(f,blk);
+			else 
+				block_mig_state.saving_traffic += BULK_BLOCK_SIZE;  
+			
+		}
+		
+		QSIMPLEQ_REMOVE_HEAD(&block_mig_state.blk_list, entry);
+		qemu_free(blk->buf);
+		qemu_free(blk);
+
+		block_mig_state.read_done--;
+		block_mig_state.transferred++;
+		assert(block_mig_state.read_done >= 0);
+	}
+	
+	 DPRINTF("%s Exit submitted %d read_done %d transferred %d\n", __FUNCTION__,
+            block_mig_state.submitted, block_mig_state.read_done,
+            block_mig_state.transferred);
+}
+
+static int64_t get_remaining_dirty(void)
+{
+	BlkMigDevState *bmds;
+	int64_t dirty = 0;
+
+	QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+		dirty += bdrv_get_dirty_count(bmds->bs);
+	}
+	return dirty * DIRTY_BLOCK_SIZE;
+}
+
+static int is_stage2_completed(void)
+{
+	int64_t remaining_dirty;
+	long double bwidth;
+
+	if (block_mig_state.bulk_completed == 1) {
+
+		remaining_dirty = get_remaining_dirty();
+		if (remaining_dirty == 0) {
+			return 1;
+		}
+
+		bwidth = compute_read_bwidth();
+
+		if ((remaining_dirty / bwidth) <=
+				migrate_max_downtime()) {
+			/* finish stage2 because we think that we can finish remaing work
+			   below max_downtime */
+
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void blk_mig_cleanup(Monitor *mon)
+{
+	BlkMigDevState *bmds;
+	BlkMigBlock *blk;
+	
+	while ((bmds = QSIMPLEQ_FIRST(&block_mig_state.bmds_list)) != NULL) {
+		QSIMPLEQ_REMOVE_HEAD(&block_mig_state.bmds_list, entry);
+		qemu_free(bmds);
+	}
+
+	while ((blk = QSIMPLEQ_FIRST(&block_mig_state.blk_list)) != NULL) {
+		QSIMPLEQ_REMOVE_HEAD(&block_mig_state.blk_list, entry);
+		qemu_free(blk->buf);
+		qemu_free(blk);
+	}
+               
+
+	set_dirty_tracking(0);
+
+	monitor_printf(mon, "\n");
+	mig_compress_cleanup();
+}
+//add by Pacer
+
+static int check_dirty_rate(void)
+{	
+	int64_t current_dirty=get_remaining_dirty();
+	if(block_mig_state.lastdirtyblk==-1)
+	{
+		block_mig_state.lastdirtyblk=current_dirty;
+		return 0;
+	}
+	else {
+		int ret;
+		if(current_dirty>= block_mig_state.lastdirtyblk)
+			ret=1;
+		else
+			ret=0;
+		block_mig_state.lastdirtyblk=current_dirty;
+		return ret;
+	}
+}
+static void set_write_throttling(int enable)
+{
+	BlkMigDevState *bmds;
+
+	QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+		bdrv_set_write_throttling(bmds->bs,enable);
+	}
+}
+
+static void set_history_tracking(BlkMigDevState *bmds,int enable)
+{
+	bdrv_set_history_tracking(bmds->bs, enable);
+}
+/*
+static void convertOptoQdict(BlockDriverState *bs, QDict* qdict1,QDict* qdict2)
+{
+	int boundary=bs->history_size * HISTORY_ALPHA;
+//	printf("boundary %d\n",boundary);
+	int i=0;
+	for(i=0;i<boundary;i++)
+	{
+		HistoryItem *hitem=QSIMPLEQ_FIRST(&bs->history_list);
+
+		int64_t offset=hitem->sector_offset;
+		int64_t length=hitem->access_length;
+	//	printf("History %d: (%"PRId64",%"PRId64")\n",i,offset,offset+length);
+		int64_t blocknum=offset;
+		for(blocknum=offset;blocknum<offset+length;blocknum++)
+		{
+			char strblocknum[20];
+			sprintf(strblocknum,"%"PRId64,blocknum);
+			int has_block = qdict_haskey(qdict1,strblocknum);
+	   		if(!has_block)
+	   		{
+	      		qdict_put(qdict1,strblocknum,qint_from_int(1));				
+	   		}
+	   		else
+	   		{
+	      		int64_t times=qdict_get_int(qdict1,strblocknum);
+				times++;
+				qdict_put(qdict1,strblocknum,qint_from_int(times));
+	   		}
+			
+		}
+		QSIMPLEQ_REMOVE_HEAD(&bs->history_list, entry);
+		qemu_free(hitem);
+	}
+
+	for(i=boundary;i<bs->history_size;i++)
+	{
+		HistoryItem *hitem=QSIMPLEQ_FIRST(&bs->history_list);
+
+		int64_t offset=hitem->sector_offset;
+		int64_t length=hitem->access_length;
+	//	printf("History %d: (%"PRId64",%"PRId64")\n",i,offset,offset+length);
+		int64_t blocknum=offset;
+		for(blocknum=offset;blocknum<offset+length;blocknum++)
+		{
+			char strblocknum[20];
+			sprintf(strblocknum,"%"PRId64,blocknum);
+			int has_block = qdict_haskey(qdict2,strblocknum);
+	   		if(!has_block)
+	   		{
+	      		qdict_put(qdict2,strblocknum,qint_from_int(1));				
+	   		}
+	   		else
+	   		{
+	      		int64_t times=qdict_get_int(qdict2,strblocknum);
+				times++;
+				qdict_put(qdict2,strblocknum,qint_from_int(times));
+	   		}
+			
+		}
+		QSIMPLEQ_REMOVE_HEAD(&bs->history_list, entry);
+		qemu_free(hitem);
+	}
+}
+
+static void computerange(int64_t totalsectors, QDict* qdict,QList* qlistrange)
+{
+	int64_t rangefrom=-1;
+	int64_t rangeend=-1;
+	int64_t i=0;
+	for(i=0;i<totalsectors;i++)
+	{
+		char strblocknum[20];
+		sprintf(strblocknum,"%"PRId64,i);
+		int has_block = qdict_haskey(qdict,strblocknum);
+	   	if(has_block)
+	   	{
+	      	if(rangefrom==-1)
+				rangefrom=i;
+			rangeend=i;		
+	   	}
+	   	else
+	   	{
+	      	if(rangefrom!=-1)
+			{
+				qlist_append_obj(qlistrange,qobject_from_jsonf("%"PRId64,rangefrom));
+				qlist_append_obj(qlistrange,qobject_from_jsonf("%"PRId64,rangeend));
+				rangefrom=-1;
+				rangeend=-1;
+			}
+	   	}			
+	}
+}
+static void computeDistanceFreq(QDict* qdict1, QDict* qdict2, QList* qlistrange, QDict* qdictDistanceFreq, int64_t* maxdistance, int* non_in_first_part)
+{
+	int i;
+    QDictEntry *entry;
+	*non_in_first_part=0;
+	*maxdistance=0;
+    for (i = 0; i < QDICT_HASH_SIZE; i++) {
+		QLIST_FOREACH(entry, &qdict2->table[i], next){
+			int has_block = qdict_haskey(qdict1,entry->key);
+	   		if(!has_block)
+	   		{
+				*non_in_first_part=*non_in_first_part+1;
+				int64_t blocknum=atoi(entry->key);
+				int64_t rangefrom=0;
+				int64_t rangeend=0;
+				int64_t lastrangefrom=0;
+				int64_t lastrangeend=0;
+
+	      		QListEntry *lentry;
+				int first=0;
+				int is_break=0;
+				QTAILQ_FOREACH(lentry, &qlistrange->head, next){
+					if(first==0){
+						lastrangefrom=rangefrom;
+						lastrangeend=rangeend;
+						rangefrom=qint_get_int(qobject_to_qint(lentry->value));
+						first=1;
+					}else{
+						first=0;
+						rangeend=qint_get_int(qobject_to_qint(lentry->value));
+						if(blocknum>rangeend)
+							continue;
+						else{
+							is_break=1;
+							break;
+						}
+					}
+				}
+				int64_t distance=0;
+				if(lastrangeend==0)
+					distance=rangefrom-blocknum;
+				else if(is_break==0)
+				{
+					distance=blocknum-rangeend;
+				}
+				else
+				{
+					distance=rangefrom-blocknum;
+					if((blocknum-lastrangeend)<distance)
+						distance=blocknum-lastrangeend;
+				}
+				if(distance>*maxdistance)
+					*maxdistance=distance;
+				char strDistance[20];
+				sprintf(strDistance, "%"PRId64,distance);
+				int has_distance=qdict_haskey(qdictDistanceFreq,strDistance);
+				if(!has_distance)
+	   			{
+	      			qdict_put(qdictDistanceFreq,strDistance,qint_from_int(1));				
+	   			}
+	   			else
+	   			{
+	      			int64_t times=qdict_get_int(qdictDistanceFreq,strDistance);
+					times++;
+					qdict_put(qdictDistanceFreq,strDistance,qint_from_int(times));
+	   			}
+			}			
+		}
+    }
+}
+static void computeStorageCover(int64_t bubblesize, int64_t neighborstep,int64_t total_sectors, QList* qlistrange, float* neighborcount, float* storagecover)
+{
+	QListEntry *entry;
+	int nbcount_index=0;
+	int scover_index=0;
+	int64_t neighbor=0;
+	for(neighbor=0;neighbor<=(bubblesize/neighborstep)*neighborstep;neighbor=neighbor+neighborstep)
+    {
+		int first=0;
+		int64_t rangefrom=0;
+		int64_t rangeend=0;
+		int64_t lastrangefrom=0;
+		int64_t lastrangeend=0;
+
+		int64_t storagerange=0;
+		int64_t ilastend=0;
+
+		QTAILQ_FOREACH(entry, &qlistrange->head, next){
+			if(first==0){
+				lastrangefrom=rangefrom;
+				lastrangeend=rangeend;
+				rangefrom=qint_get_int(qobject_to_qint(entry->value));
+				first=1;
+			}else{
+				first=0;
+				rangeend=qint_get_int(qobject_to_qint(entry->value));
+				int64_t nstart=rangefrom-neighbor;
+				int64_t nend=rangeend+neighbor;
+				if(nstart<0)
+					nstart=0;
+				if(nend>=total_sectors)
+					nend=total_sectors-1;
+				
+				if(nend<ilastend)
+					continue;
+				if(nstart>ilastend)
+					storagerange=storagerange+(nend-nstart+1);
+				else
+					storagerange=storagerange+(nend-ilastend);
+				ilastend=nend;
+			}
+
+		}		
+
+		neighborcount[nbcount_index++]=neighbor*1.0/total_sectors;
+		storagecover[scover_index++]=storagerange*1.0/total_sectors;
+
+   }
+}
+
+static float combineDisfreqStorage(QDict* qdictDistanceFreq,float* neighborcount,float* storagecover,int neighbor_testcount, int64_t total_sectors, int non_in_first_part)
+{
+	int64_t sum=0;
+	float finalfmax=0;
+	float finalflmax=0;
+	int index=0;
+
+	 QDictEntry *entry;
+
+    for(index=0;index<neighbor_testcount;index++)
+	{
+		float fl=neighborcount[index];
+		int fldistance=fl*total_sectors;
+		float fraction=0;
+		float fractionran=storagecover[index];
+		int i=0;
+		sum=0;
+		for (i = 0; i < QDICT_HASH_SIZE; i++) {
+			QLIST_FOREACH(entry, &qdictDistanceFreq->table[i], next){
+				int64_t distance=atoi(entry->key);
+				if(distance<=fldistance)
+					sum+=qint_get_int(qobject_to_qint(entry->value));
+			}
+		}
+
+		fraction=sum*1.0/non_in_first_part;
+				
+		float sumfraction=fraction+(1-fractionran);
+		if(sumfraction>finalfmax)
+		{
+			finalfmax=sumfraction;
+			finalflmax=fl;
+		}
+
+	}
+
+//	printf("final max fl=%f,fmax=%f \n",finalflmax,finalfmax);
+	return finalflmax;
+}
+static int64_t getchunksize(QDict* qdict1, QDict* qdict2, int64_t* t_sectors)
+{
+	//get the correct bs
+	BlkMigDevState *bmds;
+	BlockDriverState *bs;
+
+	time_t rawtime;
+	 struct tm * timeinfo;
+    	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("Enter getchunksize: %s\n", asctime (timeinfo) );
+
+	QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+		if(bmds->bs->history_size!=0){
+			bs=bmds->bs;
+			bmds->scheduling=1;
+		}else
+			bmds->scheduling=0;
+	}
+
+	
+    	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("before ConvertOptoQdict: %s\n", asctime (timeinfo) );
+
+	//get the [0-alpha] and [alpha-1] for history
+	convertOptoQdict(bs, qdict1, qdict2);
+
+
+	int64_t total_sectors = bdrv_getlength(bs) >> BDRV_SECTOR_BITS;
+	*t_sectors=total_sectors;
+
+  //  printf("qdict1 size %d, qdict2 size %d\n", (int)qdict_size(qdict1), (int)qdict_size(qdict2));
+	
+	//get range
+	QList *qlistrange=qlist_new();
+	
+    	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("Before compute range: %s\n", asctime (timeinfo) );
+
+    computerange(total_sectors,qdict1,qlistrange);
+
+	//get Distance frequency
+	QDict *qdictDistanceFreq=qdict_new();
+	int64_t* maxdistance=qemu_malloc(sizeof(int64_t));
+	int* non_in_first_part=qemu_malloc(sizeof(int));
+	
+	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("before computeDistanceFreq: %s\n", asctime (timeinfo) );
+
+	computeDistanceFreq(qdict1,qdict2,qlistrange,qdictDistanceFreq, maxdistance, non_in_first_part);
+	
+	//get storage coverage
+	int64_t bubblesize=*maxdistance;
+	printf("bubblesize %"PRId64"\n",*maxdistance);
+	int64_t neighborstep=0;
+	if(bubblesize<1000)
+		neighborstep=1;
+	else
+		neighborstep=bubblesize/1000;
+	int64_t neighbor_testcount=bubblesize/neighborstep+1;
+	float* neighborcount=qemu_malloc(neighbor_testcount*sizeof(float));
+	float* storagecover=qemu_malloc(neighbor_testcount*sizeof(float));
+
+	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("before computeStorageCover %s\n", asctime (timeinfo) );
+
+	computeStorageCover(bubblesize,neighborstep,total_sectors,qlistrange,neighborcount,storagecover);
+
+	//combine distance freq and storage coverage
+
+	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("before combineDisFreqStorage: %s\n", asctime (timeinfo) );
+
+	float maxcombinefl=combineDisfreqStorage(qdictDistanceFreq,neighborcount,storagecover,neighbor_testcount,total_sectors,*non_in_first_part);
+	int64_t chunksize=maxcombinefl*total_sectors;
+	
+	if(chunksize==0)
+		chunksize=MIN_CHUNK_SIZE;
+
+	if(chunksize> MAX_CHUNK_SIZE)
+		chunksize=MAX_CHUNK_SIZE;
+  
+	//free data structure
+	qemu_free(qlistrange);
+	qemu_free(qdictDistanceFreq);
+	qemu_free(maxdistance);
+	qemu_free(non_in_first_part);
+	qemu_free(neighborcount);
+	qemu_free(storagecover);
+        printf("chunksize %"PRId64"\n",chunksize);
+	return chunksize;
+}
+static void adddict2todict1(QDict *qdict1, QDict *qdict2)
+{	 
+	 QDictEntry *entry;
+	 int i=0;
+	 for (i = 0; i < QDICT_HASH_SIZE; i++) {
+		QLIST_FOREACH(entry, &qdict2->table[i], next){
+			int has_block = qdict_haskey(qdict1,entry->key);
+	   		if(!has_block){
+				int64_t times2=qdict_get_int(qdict2,entry->key);
+				qdict_put(qdict1,entry->key,qint_from_int(times2));		
+			}
+			else{
+				int64_t times1=qdict_get_int(qdict1,entry->key);
+				int64_t times2=qdict_get_int(qdict2,entry->key);
+				qdict_put(qdict1,entry->key,qint_from_int(times1+times2));			
+			}
+		}
+	 }
+}
+static void getSortedAccessedChunks(QDict *qdict1, int64_t t_sectors, int64_t chunksize)
+{
+	int64_t i=0;
+	int64_t lasthead=-1;
+	for(i=0;i<t_sectors;i=(i+chunksize))
+	{
+		int64_t writesum=0;
+		int64_t j=i;
+		for(j=i;(j<(i+chunksize))&&(j<t_sectors);j++)
+		{
+			char strblocknum[20];
+			sprintf(strblocknum,"%"PRId64,j);
+			int has_block = qdict_haskey(qdict1,strblocknum);
+	   		if(has_block)
+			{
+	      		int64_t times=qdict_get_int(qdict1,strblocknum);
+				writesum=writesum+times;
+	   		}
+		}
+		if(writesum==0)
+		{
+			lasthead=i;
+			UnaccessChunks* uchk;
+			uchk = QSIMPLEQ_LAST(&block_mig_state.unaccess_list,UnaccessChunks,entry);
+			int update=0;
+			if(uchk!=NULL)
+			{
+				if((uchk->chunkstart+uchk->length==lasthead)&&(uchk->length<BDRV_SECTORS_PER_BULK_CHUNK))
+				{
+					uchk->length=uchk->length+chunksize;
+					update=1;
+				}
+			}
+			
+			if(update==0){
+				uchk = qemu_malloc(sizeof(UnaccessChunks));
+				uchk->chunkstart=lasthead;
+				uchk->length=chunksize;
+				QSIMPLEQ_INSERT_TAIL(&block_mig_state.unaccess_list, uchk, entry);
+			}
+		}
+		else
+		{
+			AccessChunk* accesschk;
+			accesschk = qemu_malloc(sizeof(AccessChunk));
+			accesschk->chunkstart=i;
+			
+			if((i+chunksize-1)>=t_sectors)
+				accesschk->length=t_sectors-i;
+			else
+				accesschk->length=chunksize;
+			accesschk->freq=writesum;
+
+			AccessChunk* achk;
+			AccessChunk* preachk=NULL;
+			int found=0;
+			QSIMPLEQ_FOREACH(achk, &block_mig_state.access_list, entry) {
+				if((achk->freq)>writesum){
+					found=1;
+					break;
+				}else
+					preachk=achk;
+			}
+
+			if(found==1){
+				if(preachk==NULL){
+					QSIMPLEQ_INSERT_HEAD(&block_mig_state.access_list, accesschk, entry);
+				}else{
+					QSIMPLEQ_INSERT_AFTER(&block_mig_state.access_list, preachk, accesschk, entry);
+				}
+			}
+			else{
+				QSIMPLEQ_INSERT_TAIL(&block_mig_state.access_list, accesschk, entry);
+			}
+		}
+	}
+
+}
+
+
+static void printAccessChunks(void)
+{
+	AccessChunk* achk;
+	QSIMPLEQ_FOREACH(achk, &block_mig_state.access_list, entry) {
+		printf("access %"PRId64" len %d freq %"PRId64"\n", achk->chunkstart, achk->length, achk->freq);
+	}
+//	UnaccessChunks* uachk;
+//	QSIMPLEQ_FOREACH(uachk, &block_mig_state.unaccess_list, entry) {
+//		printf("unaccess from %"PRId64"\n", uachk->chunkstart);
+//	} 
+
+}
+
+*/
+
+static void getMigrateBMDS(void)
+{
+	//get the correct bs
+	BlkMigDevState *bmds;
+	
+	QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+		set_history_tracking(bmds,0);
+		if((bmds->bs->writeop_counter!=0)&&(block_mig_state.scheduling==1)){
+
+			block_mig_state.migrated_bmds=bmds;
+			bmds->scheduling=1;
+			if(block_mig_state.dscheduling==1){
+				printf("set dirty scheduling\n");
+				bdrv_set_dirty_scheduling(bmds->bs,1);
+				bmds->dirty_scheduling=1;
+			}else{
+				bdrv_set_dirty_scheduling(bmds->bs,0);
+				bmds->dirty_scheduling=0;
+			}
+			
+			WriteFreqItem *currenttail;
+			if(bmds->bs->history_active_id==1){
+				currenttail=bmds->bs->writefreqTail0;
+				bmds->chunksize=bmds->bs->chunksize0;
+				bmds->chunksize_bit=bmds->bs->chunksize1_bit;
+			}
+			else{
+				currenttail=bmds->bs->writefreqTail1;
+				bmds->chunksize=bmds->bs->chunksize1;
+				bmds->chunksize_bit=bmds->bs->chunksize1_bit;
+			}		
+			
+			bmds->access_done=0;
+			bmds->current_chunksector=0;
+			bmds->current_chunklen=0;
+			printf("Migration getchunksize %d bit %d\n",bmds->chunksize,bmds->chunksize_bit);
+		}else
+			bmds->scheduling=0;
+	}
+}
+/*
+static void scheduling(void)
+{
+	//disable history tracking
+	 time_t rawtime;
+	 struct tm * timeinfo;
+    	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("Enter scheduling: %s\n", asctime (timeinfo) );
+
+	set_history_tracking(0);
+
+	QDict *qdict1, *qdict2;
+	qdict1 = qdict_new();
+	qdict2 = qdict_new();
+	int64_t* t_sectors=qemu_malloc(sizeof(int64_t));
+	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("after sethistory tracking: %s\n", asctime (timeinfo) );
+
+	int64_t chunksize=getchunksize(qdict1,qdict2,t_sectors);
+	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("after getchunksize: %s\n", asctime (timeinfo) );
+
+	block_mig_state.chunksize=chunksize;
+	adddict2todict1(qdict1,qdict2);
+	qemu_free(qdict2);
+	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("after merge two list: %s\n", asctime (timeinfo) );
+
+	QSIMPLEQ_INIT(&block_mig_state.access_list);
+	QSIMPLEQ_INIT(&block_mig_state.unaccess_list);
+
+	getSortedAccessedChunks(qdict1,*t_sectors,chunksize);
+	time ( &rawtime );
+    	timeinfo = localtime ( &rawtime );
+    	printf("at the end of scheduling %s\n", asctime (timeinfo) );
+//	printAccessChunks();
+}
+*/
+
+static void printDirtyBlockCount(void)
+{
+	BlkMigDevState *bmds;
+	QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+		printf("dirty block count %"PRId64"\n",  bdrv_get_dirty_count(bmds->bs));
+	}
+}
+
+static int block_save_live(Monitor *mon, QEMUFile *f, int stage, void *opaque)
+{
+
+	 DPRINTF("Enter save live stage %d submitted %d transferred %d\n",
+            stage, block_mig_state.submitted, block_mig_state.transferred);
+
+	if (stage < 0) {
+		blk_mig_cleanup(mon);
+		return 0;
+	}
+
+	if (block_mig_state.blk_enable != 1) {
+		/* no need to migrate storage */
+		qemu_put_be64(f, BLK_MIG_FLAG_EOS);
+		return 1;
+	}
+
+	if (stage == 1) {
+		init_blk_migration(mon, f);
+
+		printf("getMigrateBMDS\n");
+		getMigrateBMDS();
+
+		/* start track dirty blocks */
+		set_dirty_tracking(1);
+
+		// add by Pacer for scheduling
+
+	}
+
+	flush_blks(f);
+
+	if (qemu_file_has_error(f)) {
+		blk_mig_cleanup(mon);
+		return 0;
+	}
+
+	blk_mig_reset_dirty_cursor();
+	printDirtyBlockCount();
+	if (stage == 2) {
+		
+		/* control the rate of transfer */
+		uint32_t block_size;
+		if(block_mig_state.bulk_completed ==0)
+			block_size = BULK_BLOCK_SIZE;
+		else
+			block_size = DIRTY_BLOCK_SIZE;
+
+		while ((block_mig_state.submitted +
+			block_mig_state.read_done) * block_size <
+				qemu_file_get_rate_limit(f)) {
+			//end
+			if (block_mig_state.bulk_completed == 0) {
+				/* first finish the bulk phase */
+				if (blk_mig_save_bulked_block(mon, f) == 0) {
+					/* finished saving bulk on all devices */
+					time_t rawtime;
+					struct tm * timeinfo;
+			    		time ( &rawtime );
+			    		timeinfo = localtime ( &rawtime );
+					printf("Bulk copy done: %s", asctime (timeinfo));
+
+					block_mig_state.bulk_completed = 1;
+					block_size = DIRTY_BLOCK_SIZE;
+					printDirtyBlockCount();
+				}
+			} else {
+				//printDirtyBlockCount();
+				if (blk_mig_save_dirty_block(mon, f, 1) == 0) {
+					/* no more dirty blocks */
+					break;
+				}
+			}
+		}
+
+		flush_blks(f);
+		
+		//add by Pacer
+		//check whether enable throttling
+		
+		if((block_mig_state.throttling==1)&&(block_mig_state.bulk_completed==1)){
+			block_mig_state.rr++;
+			if(block_mig_state.rr%100==0){
+				block_mig_state.rr=0;
+				int need_throttle = check_dirty_rate();
+				if(need_throttle==1){
+					set_write_throttling(1);
+					printf("set write throttling\n");
+					if(block_mig_state.throttling_starttime==0){
+						block_mig_state.throttling_starttime=qemu_get_clock_ns(rt_clock);
+						printf("start throttling %"PRId64"\n",block_mig_state.throttling_starttime);
+					}
+				}
+					 
+			}
+		}
+		//end
+
+		if (qemu_file_has_error(f)) {
+			blk_mig_cleanup(mon);
+			return 0;
+		}
+	}
+
+	if (stage == 3) {
+		/* we know for sure that save bulk is completed and
+		   all async read completed */
+		assert(block_mig_state.submitted == 0);
+		
+		while (blk_mig_save_dirty_block(mon, f, 0) != 0);
+		 
+		if(block_mig_state.throttling_starttime!=0){
+                        int64_t throttling_end=qemu_get_clock_ns(rt_clock);
+                        throttling_end=throttling_end-block_mig_state.throttling_starttime;
+                        printf("Throttling Time %"PRId64"\n",throttling_end/1000000000);
+                        BlkMigDevState *bmds;
+                        QSIMPLEQ_FOREACH(bmds, &block_mig_state.bmds_list, entry) {
+                                int i;
+                                int isum=0;
+                                for(i=1;i<51;i++)
+                                {
+                                        isum=isum+bmds->bs->throttling_level[i];
+                                }
+                                if(isum!=0)
+                                {       printf("Total Throttling OP %d\n",isum);
+					for(i=1;i<51;i++)
+                                                printf("throttle level %d num %d percent %f\n",i,bmds->bs->throttling_level[i],bmds->bs->throttling_level[i]*100.0/isum);
+                                }
+                        }
+                }
+
+		blk_mig_cleanup(mon);
+
+		/* report completion */
+		qemu_put_be64(f, (100 << BDRV_SECTOR_BITS) | BLK_MIG_FLAG_PROGRESS);
+
+		if (qemu_file_has_error(f)) {
+			return 0;
+		}
+	
+		printf("Total Dirty block: %"PRId64"\n",block_mig_state.dirtyblocknum);
+		monitor_printf(mon, "Block migration completed\n");
+	}
+
+	qemu_put_be64(f, BLK_MIG_FLAG_EOS);
+
+	return ((stage == 2) && is_stage2_completed());
+}
+
+/* Function: do_uncompression */
+/* Description: uncompress the data in input_buf to uncompress_buf */
+/* Return the amount of uncompressed data if successful. Otherwise, return 0 */
+static int32_t do_uncompression(uint8_t *input_buf,uint32_t data_len, uint8_t *uncompress_buf, uint32_t uncompress_buf_length)
+{
+	int status;
+
+	block_mig_state.incoming_stream.next_in = input_buf;
+	block_mig_state.incoming_stream.avail_in = data_len;
+
+	block_mig_state.incoming_stream.next_out = uncompress_buf;
+	block_mig_state.incoming_stream.avail_out = uncompress_buf_length;
+
+	status = inflate(&(block_mig_state.incoming_stream), Z_FULL_FLUSH);
+	uint32_t uncompress_size= uncompress_buf_length-block_mig_state.incoming_stream.avail_out;		
+
+	if(status != Z_OK){
+		fprintf(stderr, "Error occurs in uncompression. Error Code: %d, %s", status, block_mig_state.incoming_stream.msg);
+		return 0;
+	}
+
+	return uncompress_size;
+}
+
+static int block_load(QEMUFile *f, void *opaque, int version_id)
+{
+	static int banner_printed;
+	int len, flags;
+	char device_name[256];
+	int64_t addr;
+	BlockDriverState *bs;
+	uint8_t *buf;
+
+    do {
+        addr = qemu_get_be64(f);
+
+        flags = addr & ~BDRV_SECTOR_MASK;
+        addr >>= BDRV_SECTOR_BITS;
+
+        if ((flags & BLK_MIG_FLAG_DEVICE_BLOCK)||(flags & BLK_MIG_FLAG_COMPRESSED_DEVICE_BLOCK)) {   
+           /* get device name */
+	        len = qemu_get_byte(f);
+            qemu_get_buffer(f, (uint8_t *)device_name, len);
+            device_name[len] = '\0';
+
+            bs = bdrv_find(device_name);
+	    bdrv_set_history_tracking(bs, 0);
+	
+            if (!bs) {
+                fprintf(stderr, "Error unknown block device %s\n",
+                        device_name);
+                return -EINVAL;
+            }
+			
+			uint32_t data_len = qemu_get_be32(f);  
+            buf = qemu_malloc(data_len);
+			qemu_get_buffer(f, buf, data_len);
+			
+			if(flags & BLK_MIG_FLAG_DEVICE_BLOCK) {
+				bdrv_write(bs, addr, buf, data_len>>BDRV_SECTOR_BITS);
+			}
+			else {
+				uint32_t uncompress_buf_length=BULK_BLOCK_SIZE; //at most
+				uint8_t *uncompress_buf= qemu_malloc(uncompress_buf_length);
+				uint32_t uncompress_data_len= do_uncompression(buf,data_len,uncompress_buf,uncompress_buf_length);
+				bdrv_write(bs,addr, uncompress_buf, uncompress_data_len>>BDRV_SECTOR_BITS);
+				qemu_free(uncompress_buf);
+			}    
+            qemu_free(buf);
+	  
+		}else if (flags & BLK_MIG_FLAG_PROGRESS) {
+            	if (!banner_printed) {
+                	printf("Receiving block device images\n");
+                	banner_printed = 1;
+            	}
+            	printf("Completed %d %%%c", (int)addr, (addr == 100) ? '\n' : '\r');
+            	fflush(stdout);
+        }else if (!(flags & BLK_MIG_FLAG_EOS)) {
+            	fprintf(stderr, "Unknown flags %d \n", flags);
+            	return -EINVAL;
+        }
+        if (qemu_file_has_error(f)) {
+            	return -EIO;
+        }
+    } while (!(flags & BLK_MIG_FLAG_EOS));
+
+    return 0;
+}
+
+
+static void block_set_params(int blk_enable, int shared_base, int sparse, int fs_bsize, int compression, int scheduling, int dscheduling, int throttling, void *opaque)
+{
+    block_mig_state.blk_enable = blk_enable;
+    block_mig_state.shared_base = shared_base;
+
+   /* shared base means that blk_enable = 1 */
+    block_mig_state.blk_enable |= shared_base;
+
+    block_mig_state.sparse = sparse;
+    block_mig_state.fs_bsize = fs_bsize;
+    block_mig_state.compression = compression;
+    block_mig_state.scheduling = scheduling;
+    block_mig_state.dscheduling = dscheduling;
+    block_mig_state.throttling = throttling;
+}
+
+static void blk_mig_init_compressor_sparse(void)
+{
+	block_mig_state.compress_init_recv_called = 0;
+        block_mig_state.compress_init_send_called = 0;
+
+        mig_compress_init_recv();
+        mig_compress_init_send(BLK_MIG_COMPRESSION_LEVEL);
+}
+
+
+void blk_mig_init(void)
+{
+    QSIMPLEQ_INIT(&block_mig_state.bmds_list);
+    QSIMPLEQ_INIT(&block_mig_state.blk_list);
+
+    register_savevm_live("block", 0, 1, block_set_params, block_save_live,
+                         NULL, block_load, &block_mig_state);
+	
+    blk_mig_init_compressor_sparse();
+}
