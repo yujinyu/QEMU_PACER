@@ -1134,7 +1134,7 @@ static void set_throttle_delay(BlockDriverState *bs, int64_t sector_num, int nb_
 	} 
 	throttle_usleep=bs->tempusleep;
         printf("usleep %"PRId64"\n",throttle_usleep);
-
+}
 
 // Pacer Function
 void printWriteBlockDistance(BlockDriverState *bs)
@@ -1150,6 +1150,7 @@ void printWriteBlockDistance(BlockDriverState *bs)
     } 
 
 }
+
 int64_t bdrv_getNewExpireTime(BlockDriverState *bs, int64_t* pdirtyrate2,int64_t nextblock, int64_t speed, int64_t remain_time)
 {
       int64_t currenttime=qemu_get_clock(rt_clock);
@@ -1470,7 +1471,7 @@ static void set_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
         }
         bs->dirty_bitmap[idx] = val;
     }
-
+}
 
 /* Pacer Function: add for dirty block freq list tracking*/
 static void set_my_dirty_bitmap(BlockDriverState *bs, int64_t sector_num,
